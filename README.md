@@ -1,4 +1,4 @@
-# IndusDocs — PDF-first RAG with Tavily web-search fallback
+# PDF-first RAG with Tavily web-search fallback using Grok Bots
 
 IndusDocs answers from local technical PDFs first. If the PDFs do not provide enough evidence, it searches the web with Tavily. Groq is used for generating fast, concise answers from the retrieved evidence. If Groq is unavailable, the app still displays relevant PDF passages or raw web search snippets and URLs.
 

@@ -1,0 +1,312 @@
+================================================================================
+INDUSDOCS: COMPLETE STEP-BY-STEP CODE EXPLANATION GUIDE
+Project: Production RAG (Retrieval-Augmented Generation) Over Technical Manuals
+================================================================================
+
+This document is organized part-by-part. You can read it directly or use it as a 
+cheat sheet to explain the codebase in an interview, presentation, or code review.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. High-Level Architecture & What This Project Does
+2. File by File Breakdown
+3. Deep Dive: app.py (Step-by-Step & Function-by-Function)
+   - Part 1: Imports and Configuration
+   - Part 2: Text Preprocessing & Tokenization
+   - Part 3: PDF Ingestion & Overlapping Chunking
+   - Part 4: The Custom BM25 Retrieval Engine (LocalPdfRetriever)
+   - Part 5: Groq Cloud LLM Integration (ask_groq)
+   - Part 6: Grounded Answering & Hallucination Prevention (try_pdf_answer)
+   - Part 7: Web Search Fallback Engine (Tavily)
+   - Part 8: The Core Orchestrator (query_rag & is_greeting)
+   - Part 9: Command Line Interface (CLI Loop)
+4. Deep Dive: ui.py (The Browser Chat Interface)
+5. Frequently Asked Interview & Viva Questions (With Direct Answers)
+
+================================================================================
+1. HIGH-LEVEL ARCHITECTURE & WHAT THIS PROJECT DOES
+================================================================================
+
+What is IndusDocs?
+- It is a "PDF-First" Retrieval-Augmented Generation (RAG) system built to answer 
+  questions from technical equipment manuals and industrial catalogues.
+- Instead of relying on an LLM's general training memory (which can hallucinate), 
+  IndusDocs retrieves exact passages from local PDF manuals, feeds them as evidence 
+  into the LLM, and asks the LLM to synthesize a cited answer.
+
+Why "PDF-First with Web Fallback"?
+1. Local First: It searches local technical PDFs in the 'data/' folder.
+2. Fallback: If the PDFs do not contain enough information, it falls back to 
+   searching the live web using Tavily Search API.
+3. Zero-Hallucination Rule: If evidence is missing from both, it explicitly 
+   admits it does not know, rather than making up technical specs.
+
+Why BM25 Instead of Heavy Vector DBs (FAISS/Chroma/PyTorch)?
+- Many RAG setups require downloading 500MB+ PyTorch/Sentence-Transformers 
+  embedding models which run slow on CPU and cause permission/driver issues on 
+  Windows machines.
+- BM25 (Best Matching 25) is an industry-standard probabilistic lexical ranker. 
+  For technical manuals (which rely heavily on exact model numbers like "M250", 
+  "TIG-18", "duty cycle", "amperage"), BM25 is faster, lighter, and often more 
+  accurate than semantic vectors for exact-token lookups.
+
+================================================================================
+2. FILE-BY-FILE BREAKDOWN
+================================================================================
+
+- app.py: The brain of the application. Contains the PDF parser, text chunker, 
+  BM25 indexer, Groq LLM integration, Tavily fallback, and CLI loop.
+- ui.py: A zero-dependency web interface built on Python's built-in http.server. 
+  Provides a ChatGPT-like browser interface at http://localhost:8000.
+- .env: Stores environment configuration (GROQ_API_KEY, GROQ_MODEL, TOP_K).
+- requirements.txt: Lightweight dependencies (python-dotenv, pypdf).
+- data/: Directory holding all target PDF manuals and catalogues.
+
+================================================================================
+3. DEEP DIVE: app.py (STEP-BY-STEP & FUNCTION-BY-FUNCTION)
+================================================================================
+
+--------------------------------------------------------------------------------
+PART 1: IMPORTS AND CONFIGURATION (Lines 1 - 50)
+--------------------------------------------------------------------------------
+What it does:
+- Imports standard Python modules: json, math, os, re, urllib.request, Counter, 
+  and Path. Notice we use urllib.request so we don't even need the third-party 
+  'requests' library.
+- Imports 'pypdf' to extract raw text from PDF files.
+- Loads settings from '.env' using 'load_dotenv()':
+  * GROQ_API_KEY: Secret key to authenticate with Groq Cloud.
+  * GROQ_MODEL: The model to use (default: openai/gpt-oss-120b).
+  * TOP_K: Maximum number of PDF chunks to retrieve (default: 5).
+  * CHUNK_WORDS: Size of each text chunk (default: 220 words).
+  * CHUNK_OVERLAP: Word overlap between adjacent chunks (default: 40 words).
+  * MIN_BM25_SCORE: Minimum relevance threshold to consider a match valid (1.0).
+
+Key Point to Explain:
+"We externalized all hyperparameters into .env so the chunk size, overlap, and 
+relevance threshold can be adjusted without touching code."
+
+--------------------------------------------------------------------------------
+PART 2: TEXT PREPROCESSING & TOKENIZATION (Lines 51 - 70)
+--------------------------------------------------------------------------------
+Functions:
+1. tokenize(text: str) -> list[str]:
+   - Uses regex `[a-zA-Z0-9]+(?:[+#.-][a-zA-Z0-9]+)*` to extract words, numbers, 
+     and technical symbols (like "M-250" or "C++").
+   - Converts tokens to lowercase.
+   - Filters out common STOPWORDS ("a", "the", "in", "is", "hi", etc.) so they 
+     don't skew search rankings.
+
+2. clean_text(text: str) -> str:
+   - Removes null bytes (`\x00`), collapses consecutive spaces and tabs, and 
+     normalizes excessive newlines into clean paragraphs.
+
+Key Point to Explain:
+"Tokenization cleans the text and strips out filler words (stopwords) so that 
+queries match meaningful keywords like part numbers and technical specifications."
+
+--------------------------------------------------------------------------------
+PART 3: PDF INGESTION & OVERLAPPING CHUNKING (Lines 71 - 120)
+--------------------------------------------------------------------------------
+Functions:
+1. split_into_chunks(text, chunk_words=220, overlap=40) -> list[str]:
+   - Takes clean text and splits it by words using a sliding window.
+   - Step size = chunk_words - overlap (e.g., 220 - 40 = 180 words per step).
+   - Why overlap? If a critical sentence is split right at word 220, overlap 
+     ensures the complete sentence appears intact in the next chunk, preventing 
+     loss of context.
+
+2. load_pdf_chunks() -> list[dict]:
+   - Recursively scans the 'data/' folder for all '*.pdf' files.
+   - For every PDF:
+     * Reads page-by-page using `pypdf.PdfReader`.
+     * Extracts text using `page.extract_text()`.
+     * Splits page text into overlapping chunks.
+     * Stores a dictionary for every chunk:
+       {
+         "source": "Master Catalogue 2025.pdf",
+         "page": 7,
+         "chunk": 1,
+         "text": "...",
+         "tokens": ["torch", "specs", "cooling", ...]
+       }
+   - Returns a flat list of all searchable chunks across all manuals.
+
+Key Point to Explain:
+"Every chunk permanently tracks its filename and page number. This allows the 
+LLM to generate precise citations (e.g. [Master Catalogue 2025.pdf, page 7])."
+
+--------------------------------------------------------------------------------
+PART 4: THE CUSTOM BM25 RETRIEVAL ENGINE (Lines 121 - 165)
+--------------------------------------------------------------------------------
+Class: LocalPdfRetriever
+This implements the BM25 (Best Matching 25) probabilistic ranking algorithm 
+from scratch using only Python's standard library.
+
+How it works:
+1. Initialization (__init__):
+   - Computes doc_lengths: Word count of each chunk.
+   - Computes avg_doc_length: Average length across all chunks in the corpus.
+   - Computes document_frequency (DF): How many chunks contain a specific word.
+
+2. Search Method (search(question, top_k)):
+   - Tokenizes the user's question into unique query terms.
+   - Computes BM25 score for every chunk:
+     Formula: Score = IDF * (TF * (k1 + 1)) / (TF + k1 * (1 - b + b * (doc_len / avg_len)))
+     * TF (Term Frequency): How many times the query term appears in this chunk.
+     * IDF (Inverse Document Frequency): Rewards rare, specific terms (like "M405") 
+       and downweights common terms.
+     * k1 (1.5): Controls term frequency saturation. Prevents a chunk from winning 
+       just because a word is repeated 50 times.
+     * b (0.75): Length normalization penalty. Prevents long chunks from having 
+       an unfair advantage over concise chunks.
+   - Sorts chunks by score in descending order and returns the top_k best matches.
+
+Key Point to Explain:
+"BM25 is a proven, mathematically grounded ranking algorithm. We implemented it 
+in pure Python to avoid large C++ dependencies, making the app ultra-portable."
+
+--------------------------------------------------------------------------------
+PART 5: GROQ CLOUD LLM INTEGRATION (Lines 170 - 215)
+--------------------------------------------------------------------------------
+Function: ask_groq(prompt: str) -> str:
+- Groq provides ultra-fast LLM inference via an OpenAI-compatible REST API.
+- We construct an HTTP POST request to:
+  `https://api.groq.com/openai/v1/chat/completions`
+- Payload:
+  * Model: `openai/gpt-oss-120b` (configured in .env)
+  * System Message: Instructs the model to act as IndusDocs technical assistant.
+  * User Message: The prompt containing PDF passages and the user's question.
+  * Temperature: 0.2 (low temperature ensures deterministic, factual output).
+- Headers include: `Authorization: Bearer <GROQ_API_KEY>`.
+- Sends the request via `urllib.request.urlopen()`, parses the JSON response, 
+  and returns the generated string.
+
+Key Point to Explain:
+"We communicate directly with Groq's REST API using standard Python networking. 
+No external 'groq' or 'openai' SDK packages are strictly required."
+
+--------------------------------------------------------------------------------
+PART 6: GROUNDED ANSWERING & ANTI-HALLUCINATION (Lines 216 - 235)
+--------------------------------------------------------------------------------
+Function: try_pdf_answer(question, results) -> str | None:
+- Checks if the top match exceeds `MIN_BM25_SCORE` (1.0). If not, returns None.
+- Builds a strict prompt containing only the retrieved PDF chunks:
+  "Answer ONLY from the PDF passages below. Do not use outside knowledge. 
+   Cite important claims as [filename, page N]. If evidence is insufficient, 
+   reply exactly PDF_CONTEXT_INSUFFICIENT."
+- If the model replies with `PDF_CONTEXT_INSUFFICIENT`, this function catches it 
+  and returns None so the pipeline knows to trigger the fallback.
+
+Key Point to Explain:
+"This is the core anti-hallucination guardrail. By constraining the LLM with strict 
+instructions and a fallback codeword, the model never makes up false specifications."
+
+--------------------------------------------------------------------------------
+PART 7: WEB SEARCH FALLBACK (Lines 236 - 305)
+--------------------------------------------------------------------------------
+Functions:
+1. tavily_search(question: str) -> list[dict]:
+   - Triggered only if local PDFs do not answer the question.
+   - Calls Tavily's Search API (`https://api.tavily.com/search`) to search the web.
+   - Returns top titles, URLs, and text snippets.
+
+2. try_summarize_web(question, results) -> str:
+   - Feeds the web snippets into Groq to generate a concise summary citing 
+     the URLs inline as [1], [2].
+
+Key Point to Explain:
+"Tavily is search-engine built specifically for AI agents. We keep it strictly 
+as a secondary fallback so local proprietary manuals are always prioritized."
+
+--------------------------------------------------------------------------------
+PART 8: THE CORE ORCHESTRATOR (Lines 306 - 380)
+--------------------------------------------------------------------------------
+Functions:
+1. is_greeting(text: str) -> bool:
+   - Detects casual conversational greetings like "hi", "hello", "how are you".
+   - Immediately replies: "Nice to meet you. What can I do for you?"
+   - Prevents casual words from triggering false searches against the PDF index.
+
+2. query_rag(retriever, question) -> dict:
+   - The master function that connects all steps:
+     Step 1: Check if question is a greeting -> return greeting response.
+     Step 2: Run BM25 search over local PDFs.
+     Step 3: If strong match, ask Groq to answer from PDF context.
+     Step 4: If PDF answer succeeds, return answer + source citation.
+     Step 5: If PDF evidence is insufficient and Tavily is enabled, query web.
+     Step 6: If all fail, politely return an insufficient evidence message.
+
+--------------------------------------------------------------------------------
+PART 9: COMMAND LINE INTERFACE (CLI LOOP) (Lines 381 - 415)
+--------------------------------------------------------------------------------
+Function: main() -> None:
+- Runs when executing `python app.py`.
+- Loads all PDFs from `data/` and builds the index in memory.
+- Enters an interactive `while True` input loop:
+  * Accepts user questions via `input("\nYou: ")`.
+  * Calls `answer_question(retriever, question)`.
+  * Exits cleanly when user types `exit` or `quit`.
+
+================================================================================
+4. DEEP DIVE: ui.py (THE BROWSER CHAT INTERFACE)
+================================================================================
+
+Why ui.py was built:
+- To provide a modern, graphical testing environment without the overhead of 
+  Streamlit, Node.js, or React.
+
+How it works:
+1. Standard Library HTTP Server:
+   - Uses Python's `ThreadingHTTPServer` and `BaseHTTPRequestHandler`.
+   - Starts on `http://localhost:8000` and automatically opens your browser.
+
+2. Routes Handled:
+   - `GET /`: Returns the single-page HTML/CSS/JavaScript interface.
+   - `GET /api/info`: Returns JSON containing the list of loaded PDFs, total 
+     chunk count, and current active Groq model.
+   - `POST /api/chat`: Receives `{ "question": "..." }`, runs it through 
+     `query_rag()`, and returns the synthesized answer as JSON.
+
+3. Frontend Features (HTML/JS):
+   - Sidebar: Lists all 8 loaded PDFs dynamically.
+   - Quick Prompt Chips: Clickable buttons for instant testing.
+   - Markdown Parser: Renders lists, bold terms, and citations beautifully.
+   - Typing Indicator: Three bouncing dots shown while Groq is generating.
+
+================================================================================
+5. FREQUENTLY ASKED INTERVIEW / VIVA QUESTIONS & DIRECT ANSWERS
+================================================================================
+
+Q1: What is RAG and why use it instead of fine-tuning?
+A: "Fine-tuning updates model weights to learn style or tone, but it is slow, 
+expensive, and prone to hallucinations. RAG keeps the knowledge base completely 
+external in documents. When documents update, we just re-index the PDFs without 
+retraining the model. It also provides verifiable citations."
+
+Q2: Why did you implement BM25 instead of vector embeddings?
+A: "In industrial and technical documentation, users search for exact product 
+codes (like 'M250' or '0.8-1.2mm'). Vector embeddings often map alphanumeric codes 
+to fuzzy semantic coordinates, causing mismatches. BM25 provides precise lexical 
+matching, zero heavy dependencies (PyTorch/Transformers), and instantaneous indexing."
+
+Q3: Why do chunks have an overlap?
+A: "When breaking a continuous document into chunks, a critical specification or 
+sentence might get cut in half at the chunk boundary. A 40-word overlap ensures 
+contextual continuity between neighboring chunks."
+
+Q4: How does your code prevent hallucinations?
+A: "1. The system prompt explicitly commands the model to answer ONLY from the 
+provided passages. 2. We use a low temperature (0.2). 3. If evidence is lacking, 
+the model is instructed to output 'PDF_CONTEXT_INSUFFICIENT', which triggers our 
+fallback instead of a fabricated answer."
+
+Q5: Why did you use Groq instead of Gemini or OpenAI?
+A: "Groq uses specialized LPU (Language Processing Unit) hardware that delivers 
+extremely high generation speeds (often 300+ tokens/sec) and offers a free tier 
+with OpenAI-compatible endpoints."
+
+================================================================================
+END OF CODE EXPLANATION GUIDE
+================================================================================
